@@ -35,6 +35,7 @@ contributes nothing, so the corresponding metric finalizes to ``NaN``.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Callable, Iterator
 
@@ -43,6 +44,8 @@ from scipy.stats import spearmanr
 
 from physicsnemo.cfd.evaluation.datasets.schema import as_distribution
 from physicsnemo.cfd.postprocessing_tools.metric_registry import register_metric
+
+logger = logging.getLogger(__name__)
 
 _LOG_2PI = math.log(2.0 * math.pi)
 #: Numerical floor on variance for the log / division terms.
@@ -114,10 +117,47 @@ def _iter_channels(
         y2, mu2, sig2 = _as_2d(y), _as_2d(mu), _as_2d(sig)
         epi2 = _as_2d(epi_np) if epi_np is not None else None
         if y2 is None or mu2 is None or sig2 is None:
+            logger.warning(
+                "UQ metric: field %r has an unsupported ground-truth/mean/std ndim "
+                "(expected (N,) or (N, C)); skipping channel.",
+                key,
+            )
             continue
         if not (y2.shape == mu2.shape == sig2.shape):
+            logger.warning(
+                "UQ metric: shape mismatch for field %r "
+                "(ground truth %s, mean %s, std %s); "
+                "skipping channel instead of scoring misaligned points.",
+                key,
+                y2.shape,
+                mu2.shape,
+                sig2.shape,
+            )
+            continue
+        if not np.all(np.isfinite(sig2)) or np.any(sig2 < 0.0):
+            logger.warning(
+                "UQ metric: field %r has non-finite or negative std; "
+                "skipping channel instead of producing misleading calibration values.",
+                key,
+            )
             continue
         if epi2 is not None and epi2.shape != y2.shape:
+            logger.warning(
+                "UQ metric: epistemic-std shape %s for field %r does not "
+                "match ground truth %s; dropping epistemic channel.",
+                epi2.shape,
+                key,
+                y2.shape,
+            )
+            epi2 = None
+            if need_epistemic:
+                continue
+        if epi2 is not None and (not np.all(np.isfinite(epi2)) or np.any(epi2 < 0.0)):
+            logger.warning(
+                "UQ metric: field %r has non-finite or negative epistemic std; "
+                "dropping epistemic channel.",
+                key,
+            )
             epi2 = None
             if need_epistemic:
                 continue

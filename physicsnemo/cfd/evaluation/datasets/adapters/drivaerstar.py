@@ -84,6 +84,10 @@ DEFAULT_SOURCE_WSS_COMPONENT_NAMES: tuple[str, str, str] = (
 DEFAULT_PRESSURE_OUT_NAME = "pMeanTrim"
 DEFAULT_SHEAR_OUT_NAME = "wallShearStressMeanTrim"
 
+#: Allowed ``gt_data_type`` values passed through to ground-truth extraction. Validated in
+#: ``__init__`` so an unrecognized value fails loudly instead of silently yielding no ground truth.
+ALLOWED_GT_DATA_TYPES: tuple[str, str, str] = ("auto", "cell", "point")
+
 
 def _run_id_from_case_id(case_id: str) -> int:
     """Parse an integer run index from ``run_<n>`` or a decimal id (mirrors the datapipe
@@ -175,6 +179,11 @@ class DrivAerStarAdapter(DatasetAdapter):
         self._flip_wss_sign: bool = bool(kwargs.get("flip_wss_sign", True))
         self._remove_normals_area: bool = bool(kwargs.get("remove_normals_area", True))
         self._gt_data_type: str = kwargs.get("gt_data_type", "cell")
+        if self._gt_data_type not in ALLOWED_GT_DATA_TYPES:
+            raise ValueError(
+                f"Unrecognized gt_data_type {self._gt_data_type!r} "
+                f"(check ``gt_data_type``); expected one of {list(ALLOWED_GT_DATA_TYPES)!r}."
+            )
         self._cache_prepared: bool = bool(kwargs.get("cache_prepared", False))
         self._prepared_subdir: str = kwargs.get("prepared_subdir", "_prepared")
         self._pressure_out_name: str = kwargs.get(
@@ -185,15 +194,47 @@ class DrivAerStarAdapter(DatasetAdapter):
 
         self._prepared_root = self.root / self._prepared_subdir
 
+    def _case_paths(self) -> dict[str, Path]:
+        """Map case id (source file stem) -> source path for ``glob_pattern``, excluding the cache.
+
+        Case ids are file stems, so a nested (``**``) layout can pair two files with the same stem
+        onto one id. Rather than let the later match silently shadow the earlier one, a stem
+        collision raises with both paths. Insertion order follows the glob for a stable listing.
+        """
+        prepared = self._prepared_root.resolve()
+        mapping: dict[str, Path] = {}
+        for p in self.root.glob(self._glob_pattern):
+            if not p.is_file():
+                continue
+            if prepared in p.resolve().parents:
+                continue
+            existing = mapping.get(p.stem)
+            if existing is not None:
+                raise ValueError(
+                    f"DrivAerStar: duplicate case id {p.stem!r} from multiple source files "
+                    f"under {self.root} (glob_pattern={self._glob_pattern!r}): {existing} and "
+                    f"{p}. Case ids are file stems and must be unique; rename the colliding "
+                    f"file(s) or narrow ``glob_pattern``."
+                )
+            mapping[p.stem] = p
+        return mapping
+
     def _source_path(self, case_id: str) -> Path:
-        """Resolve the source ``.vtk`` for a case id (stem), honoring ``glob_pattern`` nesting."""
-        suffix = Path(self._glob_pattern).suffix or ".vtk"
-        direct = self.root / f"{case_id}{suffix}"
-        if direct.exists():
-            return direct
-        for candidate in self.root.glob(self._glob_pattern):
-            if candidate.stem == case_id:
-                return candidate
+        """Resolve the source ``.vtk`` for a case id (stem), honoring ``glob_pattern`` nesting.
+
+        When the glob can nest (``**``), resolve via :meth:`_case_paths` so a top-level/nested
+        stem collision raises here too (self-consistent with :meth:`list_cases`) rather than the
+        direct top-level path silently shadowing a nested file. For a flat glob the direct path is
+        a safe fast path.
+        """
+        if "**" not in self._glob_pattern:
+            suffix = Path(self._glob_pattern).suffix or ".vtk"
+            direct = self.root / f"{case_id}{suffix}"
+            if direct.exists():
+                return direct
+        path = self._case_paths().get(case_id)
+        if path is not None:
+            return path
         raise FileNotFoundError(
             f"Source mesh for case {case_id!r} not found under {self.root} "
             f"(glob_pattern={self._glob_pattern!r})"
@@ -209,16 +250,12 @@ class DrivAerStarAdapter(DatasetAdapter):
             return case_id
 
     def list_cases(self) -> list[str]:
-        """Return case ids: stems of source ``.vtk`` files under ``root`` (excluding cache)."""
-        prepared = self._prepared_root.resolve()
-        case_ids: list[str] = []
-        for p in self.root.glob(self._glob_pattern):
-            if not p.is_file():
-                continue
-            if prepared in p.resolve().parents:
-                continue
-            case_ids.append(p.stem)
-        return natural_sorted(case_ids)
+        """Return case ids: stems of source ``.vtk`` files under ``root`` (excluding cache).
+
+        Raises on a stem collision (see :meth:`_case_paths`) so two nested files sharing a stem
+        fail loudly instead of one silently shadowing the other.
+        """
+        return natural_sorted(self._case_paths().keys())
 
     def _transform_source_mesh(self, case_id: str) -> tuple[pv.PolyData, Path]:
         """Read the raw ``.vtk`` and apply the in-memory canonicalization transforms.

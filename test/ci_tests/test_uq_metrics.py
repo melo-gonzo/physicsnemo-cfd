@@ -25,6 +25,7 @@ import pytest
 
 from physicsnemo.cfd.evaluation.datasets.schema import (
     FieldDistribution,
+    FieldDistributionValidationError,
     as_distribution,
     build_predictive_distribution,
     distribution_mean,
@@ -54,6 +55,62 @@ def test_build_predictive_distribution_coerces_numpy_to_float32() -> None:
     assert fd.mean.dtype == np.float32
     assert fd.std.dtype == np.float32
     assert fd.epistemic_std.dtype == np.float32
+
+
+def test_build_predictive_distribution_rejects_3d_mean() -> None:
+    """A 3-D mean fails validation at construction (contract is (N,) or (N, C))."""
+    with pytest.raises(FieldDistributionValidationError, match="1-D .* or 2-D"):
+        build_predictive_distribution(mean=np.ones((2, 3, 4), dtype=np.float32))
+
+
+def test_build_predictive_distribution_rejects_std_shape_mismatch() -> None:
+    """A std channel whose shape differs from the mean fails validation."""
+    with pytest.raises(FieldDistributionValidationError, match="match mean shape"):
+        build_predictive_distribution(mean=np.ones(4), std=np.ones(5))
+
+
+def test_build_predictive_distribution_rejects_nan_mean() -> None:
+    """A non-finite mean (NumPy payload) fails loudly instead of scoring as a misleading metric."""
+    with pytest.raises(FieldDistributionValidationError, match="non-finite"):
+        build_predictive_distribution(mean=np.array([1.0, np.nan]))
+
+
+def test_build_predictive_distribution_rejects_negative_std() -> None:
+    """A negative std entry fails validation (std must be >= 0)."""
+    with pytest.raises(FieldDistributionValidationError, match="negative"):
+        build_predictive_distribution(mean=np.ones(3), std=np.array([1.0, -0.5, 1.0]))
+
+
+def test_build_predictive_distribution_rejects_wrong_point_count() -> None:
+    """``expected_num_points`` mismatch (mesh dof count) fails validation."""
+    with pytest.raises(FieldDistributionValidationError, match="4 rows"):
+        build_predictive_distribution(mean=np.ones(4), expected_num_points=7)
+    # Matching count passes.
+    fd = build_predictive_distribution(mean=np.ones(4), expected_num_points=4)
+    assert fd.mean.shape == (4,)
+
+
+def test_build_predictive_distribution_validate_false_bypasses_checks() -> None:
+    """``validate=False`` skips every check (caller opts out of the fail-loud contract)."""
+    fd = build_predictive_distribution(
+        mean=np.array([np.nan]), std=np.array([-1.0]), validate=False
+    )
+    assert math.isnan(float(fd.mean[0]))
+
+
+def test_build_predictive_distribution_torch_payload_skips_value_checks() -> None:
+    """Torch tensors pass value checks unchecked: the builder must not force a host sync on
+    on-device payloads, so finiteness/negativity are only verified for NumPy arrays here — the
+    UQ metrics' skip-and-warn guards re-check tensors at their NumPy conversion boundary.
+    Shape checks still apply (``shape`` is readable without a sync)."""
+    torch = pytest.importorskip("torch")
+    nan_mean = torch.tensor([1.0, float("nan")])
+    fd = build_predictive_distribution(mean=nan_mean, std=torch.ones(2))
+    assert fd.mean is nan_mean  # passed through untouched (no float32 coercion either)
+    with pytest.raises(FieldDistributionValidationError, match="1-D .* or 2-D"):
+        build_predictive_distribution(mean=torch.ones(2, 3, 4))
+    with pytest.raises(FieldDistributionValidationError, match="match mean shape"):
+        build_predictive_distribution(mean=torch.ones(4), std=torch.ones(5))
 
 
 def test_as_distribution_passthrough_wrap_and_none() -> None:

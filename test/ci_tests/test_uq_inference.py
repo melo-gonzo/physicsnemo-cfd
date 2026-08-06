@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 
 # Registers built-in metrics (including the pooled UQ reducers) into the registry.
 import physicsnemo.cfd.evaluation.metrics  # noqa: F401
@@ -34,7 +35,10 @@ from physicsnemo.cfd.evaluation.benchmarks.uq_inference import (
     strip_reducer_partials,
     _Welford,
 )
-from physicsnemo.cfd.evaluation.datasets.schema import FieldDistribution
+from physicsnemo.cfd.evaluation.datasets.schema import (
+    FieldDistribution,
+    FieldDistributionValidationError,
+)
 from physicsnemo.cfd.postprocessing_tools.metric_registry import get_metric
 
 
@@ -226,6 +230,77 @@ def test_select_inference_path_master_switch() -> None:
         select_inference_path(supports_uq=False, uq_method="none", uq_enabled=True)
         == "deterministic"
     )
+
+
+def test_select_inference_path_rejects_unknown_method_naming_valid_set() -> None:
+    """A typo'd ``uq_method`` (e.g. ``'sampeling'``) raises and names the valid method set."""
+    with pytest.raises(ValueError) as exc:
+        select_inference_path(supports_uq=True, uq_method="sampeling", uq_enabled=True)
+    msg = str(exc.value)
+    assert "sampeling" in msg
+    assert (
+        "closed_form" in msg and "sampling" in msg
+    )  # valid set named, not silent fallback
+
+
+def test_select_inference_path_declared_none_method_is_deterministic() -> None:
+    """``uq_method='none'`` on a UQ-capable wrapper routes deterministic (declared no-UQ, no error)."""
+    assert (
+        select_inference_path(supports_uq=True, uq_method="none", uq_enabled=True)
+        == "deterministic"
+    )
+
+
+class _FieldDroppingWrapper:
+    """Malformed two-pass stream: the second pass omits a field the first pass produced."""
+
+    SUPPORTS_UQ = True
+    UQ_METHOD = "sampling"
+
+    def predict_ensemble(self, model_input, n):
+        return [0, 1][:n]
+
+    def predict(self, model_input):  # pragma: no cover - ensemble path used
+        raise AssertionError("ensemble path should be used")
+
+    def decode_outputs(self, raw, case, model_input=None):
+        if raw == 0:
+            return {"pressure": np.ones(3), "shear_stress": np.ones((3, 3))}
+        return {"pressure": np.ones(3)}  # drops shear_stress on pass 2
+
+
+def test_run_sampling_inference_rejects_non_uniform_pass_count() -> None:
+    """A stream whose passes disagree on the field set raises instead of mixing sample sizes."""
+    with pytest.raises(ValueError, match="non-uniform pass count"):
+        run_sampling_inference(
+            _FieldDroppingWrapper(), None, None, n=2, run_seed=0, case_id="c"
+        )
+
+
+def test_run_sampling_inference_checks_expected_num_points() -> None:
+    """``expected_num_points`` (wired by the engine from the case geometry) rejects a dof mismatch."""
+    outs = [np.ones(4), np.ones(4)]
+    with pytest.raises(FieldDistributionValidationError, match="4 rows"):
+        run_sampling_inference(
+            _EnsembleWrapper(outs),
+            None,
+            None,
+            n=2,
+            run_seed=0,
+            case_id="c",
+            expected_num_points=7,
+        )
+    # A matching count validates cleanly.
+    d = run_sampling_inference(
+        _EnsembleWrapper(outs),
+        None,
+        None,
+        n=2,
+        run_seed=0,
+        case_id="c",
+        expected_num_points=4,
+    )
+    assert d["pressure"].mean.shape == (4,)
 
 
 class _GeneratorEnsembleWrapper:

@@ -262,6 +262,17 @@ def is_uq_partial_key(key: str) -> bool:
     return is_reducer_partial_key(key) or is_sample_partial_key(key)
 
 
+#: UQ inference paths a UQ-capable wrapper may request via ``UQ_METHOD``. Kept as a set (not
+#: hard-coded into the dispatch branches) so new methods register in one place and an unrecognized
+#: value is rejected rather than silently degrading to deterministic.
+_KNOWN_UQ_METHODS = frozenset({"sampling", "closed_form"})
+
+#: Declared no-UQ ``UQ_METHOD`` values (the base ``CFDModel`` default). Recognized and routed to the
+#: deterministic path so a wrapper that flips ``SUPPORTS_UQ`` on without naming a real method runs
+#: deterministically, distinct from an unrecognized (typo'd) method which still raises.
+_NO_UQ_METHODS = frozenset({"none"})
+
+
 def select_inference_path(
     *, supports_uq: bool, uq_method: str, uq_enabled: bool
 ) -> str:
@@ -271,12 +282,22 @@ def select_inference_path(
     the deterministic path regardless of ``SUPPORTS_UQ`` / ``UQ_METHOD`` — so a closed-form GP head
     is not executed as a distribution and produces no UQ metrics, matching the documented behavior
     and enabling apples-to-apples deterministic comparison runs.
+
+    On a UQ-capable wrapper with UQ enabled, a declared no-UQ ``uq_method`` (``"none"``, the base
+    ``CFDModel`` default) routes to the deterministic path; an *unrecognized* ``uq_method`` is a
+    configuration error: raise instead of silently returning ``"deterministic"`` (which would drop
+    all UQ metrics with no signal to the user).
     """
-    if uq_enabled and supports_uq and uq_method == "sampling":
-        return "sampling"
-    if uq_enabled and supports_uq and uq_method == "closed_form":
-        return "closed_form"
-    return "deterministic"
+    if not (uq_enabled and supports_uq):
+        return "deterministic"
+    if uq_method in _NO_UQ_METHODS:
+        return "deterministic"
+    if uq_method in _KNOWN_UQ_METHODS:
+        return uq_method
+    raise ValueError(
+        f"Unknown uq_method {uq_method!r} on a UQ-capable wrapper; expected one of "
+        f"{sorted(_KNOWN_UQ_METHODS)} (or set run.uq.enabled=false for a deterministic run)."
+    )
 
 
 def strip_reducer_partials(per_case_rows: list[dict[str, Any]]) -> None:
@@ -382,6 +403,7 @@ def run_sampling_inference(
     run_seed: int,
     case_id: str,
     retain_samples: bool = False,
+    expected_num_points: int | None = None,
 ) -> dict[str, FieldDistribution]:
     """Drive ``n`` stochastic passes and aggregate to a distribution per field.
 
@@ -389,6 +411,14 @@ def run_sampling_inference(
     output at a time, e.g. a generator over ensemble members), else calls
     ``wrapper.predict(model_input)`` ``n`` times, reseeding per pass from
     ``(run_seed, case_id, pass_index)`` so each pass has a distinct, reproducible RNG state.
+
+    ``expected_num_points`` (the mesh point/cell count the caller knows) is forwarded to
+    :func:`build_predictive_distribution` so each aggregated field's leading dimension is checked
+    against the mesh; left ``None`` the check is skipped. The benchmark engine wires it from the
+    case's loaded ``reference_geometry`` (``n_points`` / ``n_cells`` per the wrapper's
+    ``output_location``) when the adapter provides one. A validation failure raises
+    :exc:`~physicsnemo.cfd.evaluation.datasets.schema.FieldDistributionValidationError`, which
+    the engine recovers per case (that case's metrics score NaN and the sweep continues).
     """
     if n < 1:
         raise ValueError(f"num_samples must be >= 1 for sampling inference, got {n}")
@@ -397,8 +427,11 @@ def run_sampling_inference(
 
     accumulators: dict[str, _Welford] = {}
     samples: dict[str, list[np.ndarray]] = {}
+    n_passes = 0
 
     def _consume(raw: Any) -> None:
+        nonlocal n_passes
+        n_passes += 1
         for key, (mean, ale_var) in _decode_pass_to_arrays(
             wrapper, raw, case, model_input
         ).items():
@@ -413,6 +446,17 @@ def run_sampling_inference(
         for i in range(n):
             seed_inference_rng(run_seed, f"{case_id}#pass{i}")
             _consume(wrapper.predict(model_input))
+
+    # Every field must appear in every pass: otherwise fields keyed independently could finalize
+    # distributions built from different pass counts (a malformed stream that drops a field on some
+    # passes), silently mixing sample sizes. Assert a uniform pass count before finalizing.
+    mismatched = {key: acc.n for key, acc in accumulators.items() if acc.n != n_passes}
+    if mismatched:
+        raise ValueError(
+            f"Sampling inference for case {case_id!r} produced a non-uniform pass count across "
+            f"fields (expected {n_passes} passes per field); got {mismatched}. Every decoded pass "
+            f"must yield the same field set."
+        )
 
     distributions: dict[str, FieldDistribution] = {}
     for key, acc in accumulators.items():
@@ -431,5 +475,6 @@ def run_sampling_inference(
             epistemic_std=epistemic_std,
             aleatoric_std=aleatoric_std,
             samples=stacked,
+            expected_num_points=expected_num_points,
         )
     return distributions

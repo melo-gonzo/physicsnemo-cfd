@@ -166,6 +166,91 @@ class FieldDistribution:
     )
 
 
+class FieldDistributionValidationError(ValueError):
+    """A malformed :class:`FieldDistribution` payload (shape / non-finite / negative-std defect).
+
+    Subclasses :exc:`ValueError` so existing ``except ValueError`` handlers keep working, while
+    giving the benchmark engine a precise seam to recover **per case** without swallowing
+    unrelated ``ValueError``\\ s (e.g. configuration errors)."""
+
+
+def _distribution_shape(x: ArrayLike) -> tuple[int, ...] | None:
+    """Best-effort array shape for a NumPy array or framework tensor (``None`` if unavailable)."""
+    shape = getattr(x, "shape", None)
+    if shape is None:
+        return None
+    return tuple(int(d) for d in shape)
+
+
+def _check_finite_nonneg(arr: ArrayLike, name: str, *, nonneg: bool) -> None:
+    """Reject non-finite (and, when ``nonneg``, negative) entries for NumPy payloads.
+
+    Value checks run only for NumPy arrays: the ``build_predictive_distribution`` contract keeps
+    framework tensors on-device, so we deliberately do not force a host sync to inspect them here
+    (metrics validate them again at their NumPy conversion boundary).
+    """
+    if not isinstance(arr, np.ndarray):
+        return
+    if not np.all(np.isfinite(arr)):
+        raise FieldDistributionValidationError(
+            f"FieldDistribution.{name} contains non-finite values (NaN/Inf)."
+        )
+    if nonneg and np.any(arr < 0.0):
+        raise FieldDistributionValidationError(
+            f"FieldDistribution.{name} contains negative values; std must be >= 0."
+        )
+
+
+def validate_field_distribution(
+    dist: FieldDistribution, *, expected_num_points: int | None = None
+) -> None:
+    """Fail loudly on a malformed :class:`FieldDistribution` instead of scoring misleading values.
+
+    Checks the per-field contract the UQ metrics assume: ``mean`` is a 1-D ``(N,)`` or 2-D
+    ``(N, C)`` array; every provided std channel matches ``mean``'s shape exactly; and (for NumPy
+    payloads) ``mean`` is finite while the std channels are finite and non-negative. When
+    ``expected_num_points`` is given (e.g. the mesh point/cell count the caller knows), the leading
+    dimension must equal it; left ``None`` the check is skipped so the boundary stays
+    workflow-agnostic. Defects raise :exc:`FieldDistributionValidationError` (a
+    :exc:`ValueError` subclass).
+
+    **Abort-policy split** — who handles a defect where:
+
+    - **Builder (here / :func:`build_predictive_distribution`)**: fail loud *per case* at
+      construction, so a bad payload never reaches the metrics as a misleading number.
+    - **Benchmark engine** (``benchmarks.engine._run_single``): catches
+      :exc:`FieldDistributionValidationError` around the per-case inference stage and recovers —
+      that case's configured metrics are recorded as NaN with a ``distribution_validation_error``
+      traceback on the per-case row (audited in ``benchmark_artifacts.json``) and the sweep
+      continues; ``run.fail_on_any_metric_nan`` remains the opt-in hard failure.
+    - **UQ metric guards** (``metrics/builtin/uq.py``): skip-and-warn backstop for payloads this
+      validator cannot value-check — framework tensors (kept on device here; converted and
+      re-checked at the metrics' NumPy boundary) and legacy :class:`FieldDistribution` objects
+      built without this validator.
+    """
+    shape = _distribution_shape(dist.mean)
+    if shape is None or len(shape) not in (1, 2):
+        raise FieldDistributionValidationError(
+            f"FieldDistribution.mean must be a 1-D (N,) or 2-D (N, C) array; got shape {shape!r}."
+        )
+    if expected_num_points is not None and shape[0] != expected_num_points:
+        raise FieldDistributionValidationError(
+            f"FieldDistribution.mean has {shape[0]} rows but the mesh has "
+            f"{expected_num_points}; mean/std must be one value per mesh point or cell."
+        )
+    _check_finite_nonneg(dist.mean, "mean", nonneg=False)
+    for name in ("std", "epistemic_std", "aleatoric_std"):
+        arr = getattr(dist, name)
+        if arr is None:
+            continue
+        ashape = _distribution_shape(arr)
+        if ashape != shape:
+            raise FieldDistributionValidationError(
+                f"FieldDistribution.{name} shape {ashape!r} must match mean shape {shape!r}."
+            )
+        _check_finite_nonneg(arr, name, nonneg=True)
+
+
 def build_predictive_distribution(
     *,
     mean: ArrayLike,
@@ -175,6 +260,8 @@ def build_predictive_distribution(
     samples: ArrayLike | None = None,
     quantiles: ArrayLike | None = None,
     quantile_levels: ArrayLike | None = None,
+    validate: bool = True,
+    expected_num_points: int | None = None,
 ) -> FieldDistribution:
     """Build a :class:`FieldDistribution`, mirroring :func:`build_predictions_dict`.
 
@@ -182,6 +269,11 @@ def build_predictive_distribution(
     (prefer keyword arguments) so the predictive-distribution payload stays consistent.
     NumPy inputs are coerced to ``float32``; framework tensors (e.g. ``torch.Tensor``) are
     passed through untouched so the on-device metric path can keep them on device.
+
+    ``validate`` (default on) runs :func:`validate_field_distribution` on the built payload so a
+    shape/finiteness/negative-std defect fails at construction rather than surfacing as a
+    misleading metric; pass ``expected_num_points`` (the mesh point/cell count) to also assert the
+    leading dimension. Set ``validate=False`` to skip the check.
     """
 
     def _coerce(x: ArrayLike | None) -> ArrayLike | None:
@@ -191,7 +283,7 @@ def build_predictive_distribution(
             return x.astype(np.float32, copy=False)
         return x  # tensor or other array-like: leave as-is
 
-    return FieldDistribution(
+    dist = FieldDistribution(
         mean=_coerce(mean),
         std=_coerce(std),
         epistemic_std=_coerce(epistemic_std),
@@ -200,6 +292,9 @@ def build_predictive_distribution(
         quantiles=_coerce(quantiles),
         quantile_levels=_coerce(quantile_levels),
     )
+    if validate:
+        validate_field_distribution(dist, expected_num_points=expected_num_points)
+    return dist
 
 
 def as_distribution(predictions: dict[str, Any], key: str) -> FieldDistribution | None:
