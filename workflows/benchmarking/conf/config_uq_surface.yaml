@@ -63,6 +63,13 @@ run:
   batch_size: 1
   # Write per-case .vtp with Pred/Std/EpistemicStd arrays for ParaView spatial-UQ inspection.
   save_inference_mesh: true
+  # Write a compact per-case conformal-input export for EVERY case (independent of
+  # reports.visual_case_ids): conformal_inputs/<model>/<case>.npz with pred_<field> / true_<field>
+  # / std_<field> surface arrays in physical units (std omitted for deterministic methods, no
+  # volume meshes). The conformal_analysis.py companion reads this directory when present and falls
+  # back to inference_<model>_*.vtp otherwise. Opt-in; defaults on whenever the conformal_diagnostic
+  # metric or the companion analysis is in play.
+  conformal_export: true
   metrics_cache:
     enabled: true
     path: ${run.output_dir}/metrics_cache
@@ -211,6 +218,14 @@ metrics:
   # Sample-wise sparsification: rank geometries by aggregate uncertainty vs error (AUSE, lower=better).
   - sparsification_ause
   - sparsification_ause_epistemic
+  # conformal (our UQ work): diagnostic (approximate resplit) coverage + width,
+  # constant (residual / baseline mode) and adaptive (sigma-normalized) arms. The reported number
+  # controls ONE risk event per field: a spatial point is miscovered when ANY requested vector
+  # component escapes the band (channel_reduction="amax"), so WSS yields one risk per field, not
+  # one per component -- matching the core RiskControlCalibrator and the conformal_analysis.py
+  # companion. alpha / n_splits / test_frac / sketch_q / sigma_eps are overridable per run
+  # (e.g. `- {name: conformal_diagnostic, alpha: 0.1}`).
+  - conformal_diagnostic
   # Decision-relevant drag sparsification: rank geometries by uncertainty propagated into the Cd
   # integral (drag std) vs |Cd_pred - Cd_true|. NOTE: this applies to BOTH closed-form (GP) and
   # sampling (MC-Dropout / ensemble) rows, because drag_uq propagates the per-cell MARGINAL std the
