@@ -143,6 +143,12 @@ class RunConfig:
     fail_on_all_skipped: bool = False
     #: If True, :func:`run_benchmark` raises when any aggregate metric value in ``results[*]["metrics"]`` is NaN.
     fail_on_any_metric_nan: bool = False
+    #: Opt-in per-case conformal-input export (``conformal_inputs/<model>/<dataset>_<case>.npz``, surface
+    #: fields in physical units) consumed by the conformal companion analysis. When None (default), the
+    #: engine writes it only if a conformal metric is configured; True/False force-enable/disable.
+    conformal_export: bool | None = None
+    #: Bound on the matrix-mode per-case mesh LRU cache; 0 disables RAM caching (for large volume sweeps).
+    matrix_case_cache_size: int = 8
 
 
 @dataclass
@@ -379,6 +385,12 @@ class Config:
             distributed=bool(run_raw.get("distributed", True)),
             fail_on_all_skipped=bool(run_raw.get("fail_on_all_skipped", False)),
             fail_on_any_metric_nan=bool(run_raw.get("fail_on_any_metric_nan", False)),
+            conformal_export=(
+                None
+                if run_raw.get("conformal_export") is None
+                else _parse_bool(run_raw.get("conformal_export"), default=False)
+            ),
+            matrix_case_cache_size=int(run_raw.get("matrix_case_cache_size", 8)),
         )
         model = ModelConfig(
             **_strip_none_model_path_keys(dict(data.get("model") or {}))

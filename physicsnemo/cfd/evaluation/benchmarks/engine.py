@@ -44,8 +44,12 @@ and honours the same ``visual_case_ids`` gating.
 
 When ``save_inference_mesh`` is enabled but exporting ``inference_<model>_<case>.vt[p|u]`` fails,
 the full traceback is logged and persisted for audit: ``per_case[]`` keys and ``benchmark_artifacts.json``
-(``inference_mesh_write_failures``, ``comparison_mesh_build_failures``, ``comparison_mesh_save_failures``)
-when reproducibility artifacts are saved.
+(``inference_mesh_write_failures``, ``comparison_mesh_build_failures``, ``comparison_mesh_save_failures``,
+``conformal_export_failures``, ``distribution_validation_failures``) when reproducibility artifacts are
+saved. A per-case predictive-distribution validation failure (malformed
+:class:`~physicsnemo.cfd.evaluation.datasets.schema.FieldDistribution`) likewise marks only that
+case failed (configured metrics NaN, ``distribution_validation_error`` on the row) and the sweep
+continues; ``run.fail_on_any_metric_nan`` opts into hard failure.
 
 Multi-GPU: launch with ``torchrun`` (or any launcher that sets ``WORLD_SIZE`` /
 ``LOCAL_RANK``) so ``physicsnemo.distributed.DistributedManager`` initializes.
@@ -58,14 +62,17 @@ rank 0 only. Inference uses ``str(dm.device)`` per rank when ``DistributedManage
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import math
 import os
 import sys
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 
@@ -109,6 +116,7 @@ from physicsnemo.cfd.evaluation.common.natural_sort import natural_sorted
 from physicsnemo.cfd.evaluation.datasets.progress import log_dataset
 from physicsnemo.cfd.evaluation.datasets.schema import (
     FieldDistribution,
+    FieldDistributionValidationError,
     distribution_mean,
     normalize_inference_domain_str,
 )
@@ -185,6 +193,85 @@ _METRIC_COMPUTE_RECOVERABLE: tuple[type[BaseException], ...] = (
     OSError,
     MemoryError,
 ) + _pyvista_metric_recovery_types()
+
+
+#: Metric names (canonical + legacy alias) whose presence defaults conformal-input export on.
+_CONFORMAL_METRIC_NAMES: frozenset[str] = frozenset(
+    {"conformal_diagnostic", "conformal_crc"}
+)
+
+#: Sensible default LRU bound for the matrix-mode case cache (``run.matrix_case_cache_size``
+#: overrides). Kept small because volume VTUs are tens of GiB each; set the config knob to ``0``
+#: to disable RAM caching entirely for large volume sweeps.
+#:
+#: Reuse caveat: the matrix loop is model-outer / dataset-inner, so a case populated at
+#: ``(m0, d0, cid)`` is only revisited at ``(m1, d0, cid)`` after every other case of the whole
+#: matrix has been inserted. Cross-model read-once reuse therefore only materializes when the
+#: matrix's distinct case count is ``<=`` this bound; for a dataset larger than the cache the
+#: default degrades to re-reading each VTU per model (RAM stays bounded either way). Raise
+#: ``run.matrix_case_cache_size`` toward the per-dataset case count to recover cross-model reuse.
+_DEFAULT_MATRIX_CASE_CACHE_SIZE = 8
+
+#: Extended (protocol) kwargs the engine offers metrics beyond ``(gt, predictions)``.
+_EXTENDED_METRIC_KEYS: tuple[str, ...] = (
+    "case",
+    "comparison_mesh",
+    "metric_dtype",
+    "output",
+)
+
+
+class _BoundedCaseCache(OrderedDict):
+    """Size-capped LRU for the matrix-mode case cache, keyed by ``case_key``.
+
+    Behaves like the previous plain ``dict`` (``in`` / ``[]`` / ``clear``) but evicts the
+    least-recently-used entry once ``maxsize`` is exceeded, so the retained
+    :class:`~physicsnemo.cfd.evaluation.datasets.schema.CanonicalCase` objects (and their
+    tens-of-GiB volume meshes) cannot grow without bound across a large model × dataset matrix.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        super().__init__()
+        self._maxsize = max(1, int(maxsize))
+
+    def __getitem__(self, key: Any) -> Any:
+        self.move_to_end(key)
+        return super().__getitem__(key)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if super().__contains__(key):
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+            return
+        super().__setitem__(key, value)
+        while len(self) > self._maxsize:
+            self.popitem(last=False)
+
+
+def _accepts_all_extended_kwargs(fn: Any) -> bool | None:
+    """Whether ``fn`` accepts every :data:`_EXTENDED_METRIC_KEYS` kwarg.
+
+    Returns ``True`` (declares ``**kwargs`` or names all keys), ``False`` (legacy signature), or
+    ``None`` when the callable cannot be introspected (builtins / C callables).
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    params = sig.parameters.values()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+        return True
+    names = {p.name for p in params}
+    return all(k in names for k in _EXTENDED_METRIC_KEYS)
+
+
+def _is_unexpected_kwarg_typeerror(exc: TypeError) -> bool:
+    """True only for the arity/signature mismatch ``TypeError`` (an unexpected keyword argument).
+
+    Used to narrow the legacy-signature fallback so a genuine ``TypeError`` raised *inside* a
+    metric propagates instead of silently re-running the metric.
+    """
+    return "unexpected keyword argument" in str(exc)
 
 
 def _audit_traceback_entries(
@@ -435,6 +522,183 @@ def _save_inference_mesh_if_requested(
     return None
 
 
+def _expected_num_points_for_case(case: Any, wrapper: Any) -> int | None:
+    """Mesh dof count for validating distribution shapes, when cheaply known.
+
+    Uses the adapter-provided ``case.reference_geometry`` (``n_points`` vs ``n_cells`` per the
+    wrapper's ``output_location``) so the check costs nothing extra; returns ``None`` — check
+    skipped — when the case carries no loaded geometry (re-reading the mesh just to count dof
+    would defeat the purpose).
+    """
+    geo = getattr(case, "reference_geometry", None)
+    if geo is None:
+        return None
+    attr = (
+        "n_cells"
+        if getattr(wrapper, "output_location", "point") == "cell"
+        else "n_points"
+    )
+    n = getattr(geo, attr, None)
+    if n is None:
+        return None
+    try:
+        return int(n)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_numpy_physical(x: Any) -> np.ndarray | None:
+    """Return a NumPy view of a prediction / ground-truth array (already in physical units).
+
+    Handles NumPy arrays and framework tensors (``torch.Tensor`` via ``detach``/``cpu``) without
+    re-normalizing — wrappers denormalize before returning, so these arrays are already physical.
+    """
+    if x is None:
+        return None
+    if isinstance(x, np.ndarray):
+        return x
+    detach = getattr(x, "detach", None)
+    if callable(detach):
+        x = detach()
+    cpu = getattr(x, "cpu", None)
+    if callable(cpu):
+        x = cpu()
+    return np.asarray(x)
+
+
+def _conformal_inputs_path(
+    output_dir: str,
+    model_name: str,
+    case_id: str,
+    dataset_label: str | None = None,
+) -> Path:
+    """Per-case conformal-input file path under ``<output_dir>/conformal_inputs/<model>/``.
+
+    The dataset label is embedded in the stem (``<dataset_label>_<case>.npz``) so multi-dataset
+    sweeps that reuse case ids (e.g. per body-style classes) do not overwrite one another — the
+    same defect ``_save_inference_mesh_if_requested`` guards against. Falls back to ``<case>.npz``
+    when no label is given. The companion ``conformal_analysis.load_cases_from_export`` globs
+    ``conformal_inputs/<model>/*.npz`` (flat, case id parsed from neither), so the prefixed stem is
+    picked up unchanged.
+    """
+    label_tok = _sanitize_path_token(dataset_label) if dataset_label else ""
+    stem = (
+        f"{label_tok}_{_sanitize_path_token(case_id)}"
+        if label_tok
+        else _sanitize_path_token(case_id)
+    )
+    return (
+        Path(output_dir)
+        / "conformal_inputs"
+        / _sanitize_path_token(model_name)
+        / f"{stem}.npz"
+    )
+
+
+#: String tokens (case-insensitive) that read as False when a bool knob arrives as a raw string.
+#: Mirrors ``config._parse_bool`` so a CLI override like ``run.conformal_export=false`` disables the
+#: export even when it reaches the engine un-coerced (stored as the string ``"false"``).
+_FALSEY_STRINGS: frozenset[str] = frozenset({"", "false", "0", "no", "off"})
+
+
+def _coerce_optional_bool(flag: Any) -> bool:
+    """Interpret a possibly-string flag as a bool. ``bool("false")`` is ``True``; this is not."""
+    if isinstance(flag, str):
+        return flag.strip().lower() not in _FALSEY_STRINGS
+    return bool(flag)
+
+
+def _conformal_export_enabled(
+    run_config: RunConfig, metric_names: list[tuple[str, dict]]
+) -> bool:
+    """Resolve whether to write the per-case conformal-input ``.npz`` files.
+
+    Opt-in via ``run.conformal_export``; when that flag is unset (``None``), it defaults to on
+    whenever a conformal diagnostic metric is configured (the companion ``conformal_analysis.py``
+    consumes the same files). Reading the flag defensively keeps the engine workflow-agnostic and
+    independent of whether the config schema declares the field. The flag is coerced through
+    :func:`_coerce_optional_bool` so an un-coerced CLI string (e.g. ``"false"`` / ``"0"``) still
+    disables the export instead of being truthy under a plain ``bool()``.
+    """
+    flag = getattr(run_config, "conformal_export", None)
+    if flag is not None:
+        return _coerce_optional_bool(flag)
+    return any(name in _CONFORMAL_METRIC_NAMES for name, _ in metric_names)
+
+
+def _write_conformal_inputs(
+    *,
+    output_dir: str,
+    model_name: str,
+    case_id: str,
+    predictions: dict[str, Any],
+    gt: dict[str, Any],
+    case: Any,
+    dataset_name: str,
+    dataset_label: str | None = None,
+) -> str | None:
+    """Write a compact per-case ``.npz`` of surface fields (pred / true / std) in physical units.
+
+    For every canonical field present in both ``predictions`` and ``gt`` it stores
+    ``pred_<field>`` and ``true_<field>`` (shape ``N`` or ``Nx3``) plus ``std_<field>`` when the
+    prediction is a :class:`FieldDistribution` with a std (omitted otherwise), and ``points``
+    (``Nx3``) when the case exposes reference geometry. Every file additionally carries a
+    ``dataset`` key — a 0-d string array holding ``dataset_label`` (empty string when no label) —
+    so the companion ``conformal_analysis`` reader can group cases by dataset without parsing
+    filenames (the label also stays embedded in the file stem; see :func:`_conformal_inputs_path`).
+    Cheap by design (arrays only, no mesh write). Returns ``None`` on success or a traceback
+    string on a recoverable I/O failure.
+
+    When there is nothing to export (empty ``gt`` or no field overlapping ``gt``), a ``.npz``
+    holding only the ``dataset`` key is still written so the per-case file exists on disk. This
+    lets the metrics-cache existence check (``conformal_export_owed``) be satisfied for such
+    no-op cases, so later runs honour the cache hit instead of re-running full inference every
+    time. The companion ``conformal_analysis`` loader carries no ``pred_``/``true_`` fields for
+    these files and skips them, matching the "no field, no contribution" semantics.
+    """
+    arrays: dict[str, np.ndarray] = {}
+    if gt:
+        for key, value in predictions.items():
+            if key not in gt or gt[key] is None:
+                continue
+            pred = _to_numpy_physical(distribution_mean(value))
+            true = _to_numpy_physical(gt[key])
+            if pred is None or true is None:
+                continue
+            arrays[f"pred_{key}"] = pred
+            arrays[f"true_{key}"] = true
+            if isinstance(value, FieldDistribution) and value.std is not None:
+                std = _to_numpy_physical(value.std)
+                if std is not None:
+                    arrays[f"std_{key}"] = std
+    if arrays:
+        ref_geo = getattr(case, "reference_geometry", None)
+        pts = getattr(ref_geo, "points", None) if ref_geo is not None else None
+        if pts is not None:
+            try:
+                arrays["points"] = np.asarray(pts)
+            except (TypeError, ValueError):
+                pass
+    # Group-by key for the companion reader — written into EVERY npz, including the documented
+    # no-op (empty-gt) files, so multi-dataset sweeps reusing case ids split without filename
+    # parsing. A missing label falls back to the (required) dataset name so two datasets sharing
+    # a case id can never collide on the same stem or group.
+    effective_label = dataset_label if dataset_label else dataset_name
+    arrays["dataset"] = np.array(effective_label)
+    out_path = _conformal_inputs_path(output_dir, model_name, case_id, effective_label)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(str(out_path), **arrays)
+    except _MESH_IO_BRIDGE_ERRORS:
+        tb = traceback.format_exc()
+        log_dataset(
+            dataset_name,
+            f"Could not write conformal inputs to {out_path}:\n{tb}",
+        )
+        return tb
+    return None
+
+
 def _call_metric(
     fn: Any,
     gt: dict,
@@ -482,10 +746,19 @@ def _call_metric(
         metric_dtype=metric_dtype,
         output=output,
     )
+    accepts = _accepts_all_extended_kwargs(fn)
+    if accepts is True:
+        return fn(gt, predictions, **extended)
+    if accepts is False:
+        return fn(gt, predictions, **mkwargs)
+    # Un-introspectable callable: try the extended call, but fall back ONLY on an actual
+    # signature/arity mismatch so a real TypeError inside the metric propagates (no double run).
     try:
         return fn(gt, predictions, **extended)
-    except TypeError:
-        return fn(gt, predictions, **mkwargs)
+    except TypeError as exc:
+        if _is_unexpected_kwarg_typeerror(exc):
+            return fn(gt, predictions, **mkwargs)
+        raise
 
 
 def _call_reducer_partial(
@@ -510,10 +783,19 @@ def _call_reducer_partial(
         metric_dtype=metric_dtype,
         output=output,
     )
+    accepts = _accepts_all_extended_kwargs(metric.partial)
+    if accepts is True:
+        return metric.partial(gt, predictions, **extended)
+    if accepts is False:
+        return metric.partial(gt, predictions, **mkwargs)
+    # Un-introspectable callable: try the extended call, but fall back ONLY on an actual
+    # signature/arity mismatch so a real TypeError inside the metric propagates (no double run).
     try:
         return metric.partial(gt, predictions, **extended)
-    except TypeError:
-        return metric.partial(gt, predictions, **mkwargs)
+    except TypeError as exc:
+        if _is_unexpected_kwarg_typeerror(exc):
+            return metric.partial(gt, predictions, **mkwargs)
+        raise
 
 
 def _run_single(
@@ -610,6 +892,10 @@ def _run_single(
                 {},
             )
         raise ValueError(reason)
+
+    # Per-case conformal-input export (opt-in; defaults on when a conformal metric is configured).
+    # Written for EVERY scored case, independent of ``reports.visual_case_ids``.
+    export_conformal = _conformal_export_enabled(run_config, metric_names)
 
     dkwargs = resolve_dataset_kwargs_for_model(dataset_config.kwargs, model_config.name)
     adapter = adapter_class(root=dataset_config.root, **dkwargs)
@@ -711,7 +997,16 @@ def _run_single(
                 and blob.get("case_id") == cid
             ):
                 cached_metrics = metrics_from_cache_json(blob.get("metrics"))
-                if cached_metrics is not None:
+                # A cache hit skips inference — but the conformal-input export needs the raw
+                # predictions. If an export is owed and the ``.npz`` is not already present, fall
+                # through to full inference so this case still gets its conformal file.
+                conformal_export_owed = (
+                    export_conformal
+                    and not _conformal_inputs_path(
+                        output_dir, m_label, cid, ds_label
+                    ).exists()
+                )
+                if cached_metrics is not None and not conformal_export_owed:
                     for mkey, val in cached_metrics.items():
                         all_metric_values.setdefault(mkey, []).append(val)
                     row_cb: dict[str, Any] = {"case_id": cid, "metrics": cached_metrics}
@@ -766,24 +1061,66 @@ def _run_single(
             uq_method=getattr(wrapper, "UQ_METHOD", "none"),
             uq_enabled=run_config.uq.enabled,
         )
-        if inference_path == "sampling":
-            # N stochastic passes; prepare_inputs already ran once (only the forward is repeated).
-            predictions = run_sampling_inference(
-                wrapper,
-                case,
-                model_input,
-                n=run_config.uq.num_samples,
-                run_seed=run_config.seed,
-                case_id=cid,
-                retain_samples=run_config.uq.retain_samples,
+        # Per-case recovery seam: ``build_predictive_distribution(validate=True)`` fails loudly on
+        # a malformed payload (NaN/Inf mean, negative std, shape defects) with
+        # :exc:`FieldDistributionValidationError`. One bad case must not abort a long sweep, so
+        # catch exactly that error here, record the case as failed (configured metrics NaN +
+        # ``distribution_validation_error`` traceback on the per-case row, audited in
+        # ``benchmark_artifacts.json``), and continue. ``run.fail_on_any_metric_nan`` remains the
+        # opt-in hard failure. See ``validate_field_distribution`` for the full policy split.
+        try:
+            if inference_path == "sampling":
+                # N stochastic passes; prepare_inputs already ran once (only the forward is repeated).
+                predictions = run_sampling_inference(
+                    wrapper,
+                    case,
+                    model_input,
+                    n=run_config.uq.num_samples,
+                    run_seed=run_config.seed,
+                    case_id=cid,
+                    retain_samples=run_config.uq.retain_samples,
+                    expected_num_points=_expected_num_points_for_case(case, wrapper),
+                )
+            elif inference_path == "closed_form":
+                raw = wrapper.predict(model_input)
+                predictions = wrapper.decode_distribution(raw, case, model_input)
+            else:
+                raw = wrapper.predict_deterministic(model_input)
+                predictions = wrapper.decode_outputs(raw, case, model_input)
+        except FieldDistributionValidationError:
+            dist_tb = traceback.format_exc()
+            log_dataset(
+                dataset_config.name,
+                f"Predictive-distribution validation FAILED for case {cid!r} "
+                f"(case marked failed, configured metrics recorded as NaN, run continues):\n"
+                f"{dist_tb}",
             )
-        elif inference_path == "closed_form":
-            raw = wrapper.predict(model_input)
-            predictions = wrapper.decode_distribution(raw, case, model_input)
-        else:
-            raw = wrapper.predict_deterministic(model_input)
-            predictions = wrapper.decode_outputs(raw, case, model_input)
+            failed_metrics: dict[str, float] = {}
+            for mname, _mkwargs in metric_names:
+                failed_metrics[mname] = float("nan")
+                all_metric_values.setdefault(mname, []).append(float("nan"))
+            per_case.append(
+                {
+                    "case_id": cid,
+                    "metrics": failed_metrics,
+                    "distribution_validation_error": dist_tb,
+                }
+            )
+            continue
         gt = case.ground_truth or {}
+
+        conformal_export_err: str | None = None
+        if export_conformal:
+            conformal_export_err = _write_conformal_inputs(
+                output_dir=output_dir,
+                model_name=m_label,
+                case_id=cid,
+                predictions=predictions,
+                gt=gt,
+                case=case,
+                dataset_name=dataset_config.name,
+                dataset_label=ds_label,
+            )
 
         inference_mesh_err = _save_inference_mesh_if_requested(
             run_config=run_config,
@@ -889,6 +1226,8 @@ def _run_single(
         row: dict[str, Any] = {"case_id": cid, "metrics": case_metrics}
         if inference_mesh_err:
             row["inference_mesh_write_error"] = inference_mesh_err
+        if conformal_export_err:
+            row["conformal_export_error"] = conformal_export_err
         if comparison_mesh_build_err:
             row["comparison_mesh_build_error"] = comparison_mesh_build_err
         if comparison_mesh is not None and metric_dtype is not None:
@@ -1073,7 +1412,17 @@ def run_benchmark(
         # Single read per (dataset, dkwargs, case_id) across all models. Volume VTUs are
         # tens of GiB; without this, each model's adapter re-reads the same file and the
         # in-flight read coexists in RAM with the previous model's retained ``mesh_ctx``.
-        matrix_case_cache: dict[tuple, Any] = {}
+        # The cache is a size-capped LRU so retained cases cannot grow without bound across a
+        # large matrix (it previously cleared only after the whole matrix finished). Bound is
+        # ``run.matrix_case_cache_size`` (default :data:`_DEFAULT_MATRIX_CASE_CACHE_SIZE`); set it
+        # to ``0`` to disable RAM caching entirely for very large volume sweeps.
+        cache_size = getattr(config.run, "matrix_case_cache_size", None)
+        if cache_size is None:
+            cache_size = _DEFAULT_MATRIX_CASE_CACHE_SIZE
+        cache_size = int(cache_size)
+        matrix_case_cache: _BoundedCaseCache | None = (
+            _BoundedCaseCache(cache_size) if cache_size > 0 else None
+        )
         for m_cfg in models:
             for d_cfg in datasets:
                 # Free residual wrapper / dataset state from the previous matrix iteration so the
@@ -1098,7 +1447,8 @@ def run_benchmark(
                 )
                 results.append(res)
                 meshes_by_run.append(mesh_ctx)
-        matrix_case_cache.clear()
+        if matrix_case_cache is not None:
+            matrix_case_cache.clear()
 
     if dm is not None and dm.world_size > 1 and config.run.distributed:
         results, meshes_by_run = gather_merge_benchmark_outputs(
@@ -1137,6 +1487,12 @@ def run_benchmark(
             cmp_save_failures = _audit_traceback_entries(
                 results, "comparison_mesh_save_error"
             )
+            conformal_export_failures = _audit_traceback_entries(
+                results, "conformal_export_error"
+            )
+            distribution_validation_failures = _audit_traceback_entries(
+                results, "distribution_validation_error"
+            )
             payload: dict[str, Any] = {
                 "config": _config_to_dict(config),
                 "results_summary": [
@@ -1157,6 +1513,12 @@ def run_benchmark(
                 payload["comparison_mesh_build_failures"] = cmp_build_failures
             if cmp_save_failures:
                 payload["comparison_mesh_save_failures"] = cmp_save_failures
+            if conformal_export_failures:
+                payload["conformal_export_failures"] = conformal_export_failures
+            if distribution_validation_failures:
+                payload["distribution_validation_failures"] = (
+                    distribution_validation_failures
+                )
             json.dump(payload, f, indent=2)
 
     if is_rank0:
