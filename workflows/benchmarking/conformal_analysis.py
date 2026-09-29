@@ -28,13 +28,13 @@ the distribution-free machinery add, and how does it compare across models?":
 
 **Risk event (unified with the metric).** Per surface *field* a spatial POINT is miscovered when
 **any** requested vector component escapes the band: the per-point nonconformity score is reduced
-over the field's components with ``amax`` before thresholding, exactly as the core
-``RiskControlCalibrator(channel_reduction="amax")`` (its default) and the in-table
-``conformal_diagnostic`` metric do. A vector field (WSS) therefore yields ONE risk per field, not
-one lambda pooled over raveled components. λ̂ itself is fit by the core ``RiskControlCalibrator``
-end to end, so this is the library-exact reference for the *event*; the reported coverage/width
-are still an approximate resplit view (repeated random cal/test splits of the evaluation cases),
-not a single fitted-then-held-out guarantee.
+over the field's components with ``amax`` before thresholding. This is the fixed point-event risk
+implemented by the core ``RiskControlCalibrator`` and by the in-table ``conformal_diagnostic``
+metric. A vector field (WSS) therefore yields ONE risk per field, not one lambda pooled over
+raveled components. λ̂ itself is fit by the core ``RiskControlCalibrator`` end to end, so this is
+the library-exact reference for the *event*; the reported coverage/width are still an approximate
+resplit view (repeated random cal/test splits of the evaluation cases), not a single
+fitted-then-held-out guarantee.
 
 **Inputs.** Prefers the engine's compact per-case export
 ``<results_dir>/conformal_inputs/<model>/<dataset_label>_<case>.npz`` (``pred_<field>`` /
@@ -77,7 +77,8 @@ logger = logging.getLogger(__name__)
 
 # Channel order of the standard surface fields (matches the wrappers / nominal metrics).
 _VEC3 = ("x", "y", "z")
-#: Default σ floor for the adaptive (σ-normalized) arm; mirrors the core NormalizedError default.
+#: Default σ floor for the adaptive (σ-normalized) arm; mirrors the core ``NormalizedErrorScore``
+#: default ``eps``.
 _SIGMA_EPS = 1e-8
 
 
@@ -91,20 +92,33 @@ def _reduced_score(
 ) -> np.ndarray:
     """Per-POINT nonconformity score for one case/arm, via the library score objects.
 
-    Components are reduced with ``amax`` *after* scoring (``NormalizedError`` normalizes each
-    component by its own σ first), so a point is miscovered when ANY component escapes the band —
-    the exact loss ``RiskControlCalibrator(channel_reduction="amax")`` certifies. Imports the
-    core conformal library lazily (only callers that actually score need it on the path).
+    Components are reduced with ``amax`` *after* scoring (``NormalizedErrorScore`` normalizes
+    each component by its own σ first), so a point is miscovered when ANY component escapes the
+    band: the fixed point-event loss ``RiskControlCalibrator`` certifies. Imports the core
+    conformal library lazily (only callers that actually score need it on the path).
+
+    ``sigma`` is the raw per-point predictive std, passed unclamped as ``aux={"sigma": ...}``;
+    ``NormalizedErrorScore(eps=eps)`` applies the floor. This is the single point where the
+    predictive std enters the core conformal library. Its upstream path: sampling wrappers
+    (MC-Dropout, ensembles) aggregate passes in ``uq_inference._Welford`` into
+    ``FieldDistribution.std`` (total std, physical units), closed-form wrappers (GP) set that std
+    directly, the engine's ``_write_conformal_inputs`` saves it as ``std_<field>``, and
+    :func:`load_cases_from_export` loads it as ``case["sigma"]``. Swapping the streaming
+    statistics for a shared core accumulator only has to keep that ``FieldDistribution.std``
+    contract.
     """
-    from physicsnemo.experimental.uq.conformal import AbsoluteError, NormalizedError
+    from physicsnemo.experimental.uq.conformal import (
+        AbsoluteErrorScore,
+        NormalizedErrorScore,
+    )
 
     p = torch.from_numpy(np.ascontiguousarray(pred, dtype=np.float64))
     t = torch.from_numpy(np.ascontiguousarray(true, dtype=np.float64))
     if arm == "constant":
-        s = AbsoluteError().score(p, t).numpy()
+        s = AbsoluteErrorScore().score(p, t).numpy()
     else:
-        sig = torch.from_numpy(np.maximum(sigma, eps).astype(np.float64))
-        s = NormalizedError(eps=eps).score(p, t, aux={"sigma": sig}).numpy()
+        sig = torch.from_numpy(np.ascontiguousarray(sigma, dtype=np.float64))
+        s = NormalizedErrorScore(eps=eps).score(p, t, aux={"sigma": sig}).numpy()
     if s.ndim > 1:
         s = s.max(axis=tuple(range(1, s.ndim)))
     return s.ravel()
@@ -119,19 +133,18 @@ def _lam_hat(cal_scores: list[np.ndarray], alpha: float) -> float:
     Imports the core conformal library lazily.
     """
     from physicsnemo.experimental.uq.conformal import (
-        AbsoluteError,
+        AbsoluteErrorScore,
         RiskControlCalibrator,
     )
 
-    calib = RiskControlCalibrator(AbsoluteError(), alpha=alpha)
+    calib = RiskControlCalibrator(AbsoluteErrorScore(), alpha=alpha)
     for s in cal_scores:
         n = s.shape[0]
-        calib.update(
+        calib.update_sample(
             torch.zeros(n, dtype=torch.float64),
             torch.from_numpy(s.astype(np.float64)),
         )
-    lam = calib.finalize(distributed=False).lam
-    return float(lam if not isinstance(lam, dict) else next(iter(lam.values())))
+    return float(calib.finalize().thresholds)
 
 
 def _default_ncal_grid(n: int, n_test_min: int) -> tuple[int, ...]:

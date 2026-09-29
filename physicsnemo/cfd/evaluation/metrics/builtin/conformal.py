@@ -31,16 +31,16 @@ guarantee.
 
 **Risk event (what the reported number controls).** For each surface *field* (pressure; wss) a
 spatial POINT is declared *miscovered* when **any** requested vector component escapes the band —
-the per-point nonconformity score is the max over the field's components (``channel_reduction=
-"amax"``), so a vector field yields ONE risk per field, not one per component. This matches the
-core ``RiskControlCalibrator``'s default ``channel_reduction="amax"`` loss (a true point fraction)
-and the companion ``conformal_analysis.py``; both paths therefore control the *same* event. The
-loss weights points uniformly (point-count weighting).
+the per-point nonconformity score is the max over the field's components, so a vector field yields
+ONE risk per field, not one per component. This is the fixed point-event loss in the core
+``RiskControlCalibrator`` (a true point fraction) and the companion ``conformal_analysis.py``;
+both paths therefore control the *same* event. The loss weights points uniformly (point-count
+weighting).
 
 Per field and as a headline ``mean_*`` it reports (all in **physical units**):
 
 * ``diag_coverage_const`` / ``diag_width_const``   — resplit band from the **residual** score
-  (``AbsoluteError``); defined for *any* model, including the deterministic baseline ("baseline
+  (``AbsoluteErrorScore``); defined for *any* model, including the deterministic baseline ("baseline
   mode": no model σ used).
 * ``diag_coverage_adaptive`` / ``diag_width_adaptive`` — resplit band from the **σ-normalized**
   score (the model's own ``std``); ``NaN`` for a model with no ``std``.
@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 #: Overridable per run via the ``sketch_q`` metric-spec key.
 _DEFAULT_SKETCH_Q = 129
 #: Default σ floor for the normalized (adaptive) score. Single-source MIRROR of the core
-#: ``physicsnemo.experimental.uq.conformal.NormalizedError(eps=1e-8)`` default, duplicated here
+#: ``physicsnemo.experimental.uq.conformal.NormalizedErrorScore(eps=1e-8)`` default, duplicated here
 #: (not imported) so the diagnostic runs without the core conformal branch installed; if the core
 #: default changes, update this mirror. Overridable per run via the ``sigma_eps`` metric-spec key.
 _DEFAULT_SIG_EPS = 1e-8
@@ -161,8 +161,8 @@ def _iter_fields(gt: dict, predictions: dict):
     ``resid`` is the ``(N, C)`` absolute residual and ``sigma`` is ``(N, C)`` (or ``None``); the
     per-point risk event (a point fails if ANY of its ``C`` components escapes the band) is applied
     by the caller as an ``amax`` over the ``C`` columns, mirroring the core
-    ``RiskControlCalibrator(channel_reduction="amax")``. For 3-vector fields the ``C`` columns are
-    the :data:`_VEC3` components.
+    ``RiskControlCalibrator``'s fixed trailing-component reduction. For 3-vector fields the ``C``
+    columns are the :data:`_VEC3` components.
 
     Non-finite guard (skip-and-warn, matching the sibling UQ metrics): a case-field with any
     non-finite ground truth or mean is **skipped** with a warning — a NaN sketch on the test side
@@ -270,7 +270,7 @@ class _ConformalDiagnostic:
             if sig is not None:
                 s = np.maximum(sig, eps)
                 # Normalize per component, THEN reduce with amax (the reduction must follow the
-                # σ-normalization, matching NormalizedError under channel_reduction="amax").
+                # σ-normalization, matching the core's fixed point-event reduction).
                 adapt_score = (resid / s).max(axis=1)
                 ask = _sketch(adapt_score, q)
                 for g in range(q):
@@ -370,7 +370,7 @@ class _ConformalDiagnostic:
         Infeasible splits (``α < 1/(n_cal+1)``) contribute nothing; all-infeasible → ``NaN``.
         """
         n = sketches.shape[0]
-        n_test = max(2, int(round(test_frac * n)))
+        n_test = max(2, round(test_frac * n))
         n_cal = n - n_test
         if n_cal < 2 or alpha < 1.0 / (n_cal + 1.0):
             return float("nan"), float("nan")
@@ -417,7 +417,7 @@ class _ConformalDiagnostic:
 
 
 def _nanmean(xs: list[float]) -> float:
-    xs = [x for x in xs if x == x]
+    xs = [x for x in xs if not np.isnan(x)]
     return float(np.mean(xs)) if xs else float("nan")
 
 

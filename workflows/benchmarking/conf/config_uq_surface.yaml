@@ -221,10 +221,10 @@ metrics:
   # conformal (our UQ work): diagnostic (approximate resplit) coverage + width,
   # constant (residual / baseline mode) and adaptive (sigma-normalized) arms. The reported number
   # controls ONE risk event per field: a spatial point is miscovered when ANY requested vector
-  # component escapes the band (channel_reduction="amax"), so WSS yields one risk per field, not
-  # one per component -- matching the core RiskControlCalibrator and the conformal_analysis.py
-  # companion. alpha / n_splits / test_frac / sketch_q / sigma_eps are overridable per run
-  # (e.g. `- {name: conformal_diagnostic, alpha: 0.1}`).
+  # component escapes the band, so WSS yields one risk per field, not one per component. This is
+  # the fixed point-event risk in the core RiskControlCalibrator and the conformal_analysis.py
+  # companion. alpha / n_splits / test_frac / sketch_q / sigma_eps are overridable per run (e.g.
+  # `- {name: conformal_diagnostic, alpha: 0.1}`).
   - conformal_diagnostic
   # Decision-relevant drag sparsification: rank geometries by uncertainty propagated into the Cd
   # integral (drag std) vs |Cd_pred - Cd_true|. NOTE: this applies to BOTH closed-form (GP) and
