@@ -140,7 +140,7 @@ def _lam_hat(cal_scores: list[np.ndarray], alpha: float) -> float:
     calib = RiskControlCalibrator(AbsoluteErrorScore(), alpha=alpha)
     for s in cal_scores:
         n = s.shape[0]
-        calib.update_sample(
+        calib.update(
             torch.zeros(n, dtype=torch.float64),
             torch.from_numpy(s.astype(np.float64)),
         )
